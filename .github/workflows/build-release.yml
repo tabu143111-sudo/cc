@@ -131,5 +131,3 @@ jobs:
             --notes "Built from \`${{ steps.zip.outputs.file }}\` (commit ${{ github.sha }}).
           Version name: ${{ steps.ver.outputs.name }} · version code: ${{ steps.ver.outputs.code }}.
           Install over the previous version: your data is kept (same built-in signing key every time)."
-          permissions:
-  contents: write
