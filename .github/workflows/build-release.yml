@@ -1,0 +1,133 @@
+name: Build and Release APK
+
+# Runs when you push/upload a .zip to the root of the repo (or run it by hand from the Actions tab).
+on:
+  push:
+    branches: [ main, master ]
+    paths: [ '*.zip', '.github/workflows/build-release.yml' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the Release
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so we can tell which zip is the newest
+
+      - name: Prepare signing key (created once, then reused forever)
+        run: |
+          # The same key must sign every build, otherwise Android refuses to update over the old app.
+          # First run: create it and save it in the repo (.signing/release.jks). Later runs: reuse it.
+          if [ ! -f .signing/release.jks ]; then
+            mkdir -p .signing
+            keytool -genkeypair -v -keystore .signing/release.jks -storepass android -keypass android \
+              -alias release -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=App Release, O=Personal, C=US"
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .signing/release.jks
+            git commit -m "Add app signing key (auto-generated, keeps updates installable)"
+            git push origin "HEAD:${{ github.ref_name }}"
+          fi
+
+      - name: Find the newest zip in the repo root
+        id: zip
+        run: |
+          shopt -s nullglob
+          zips=( *.zip )
+          [ ${#zips[@]} -gt 0 ] || { echo "::error::No .zip found in the repo root"; exit 1; }
+          best=""; bestt=0
+          for z in "${zips[@]}"; do
+            t=$(git log -1 --format=%ct -- "$z" 2>/dev/null || echo 0)
+            [ -z "$t" ] && t=0
+            if [ "$t" -ge "$bestt" ]; then best="$z"; bestt="$t"; fi
+          done
+          echo "Using zip: $best"
+          echo "file=$best" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip and locate the Gradle project
+        id: proj
+        run: |
+          rm -rf "$RUNNER_TEMP/src" && mkdir -p "$RUNNER_TEMP/src"
+          unzip -q "${{ steps.zip.outputs.file }}" -d "$RUNNER_TEMP/src" -x '__MACOSX/*'
+          settings=$(find "$RUNNER_TEMP/src" \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' | awk '{ print length($0) " " $0 }' | sort -n | head -n1 | cut -d' ' -f2-)
+          [ -n "$settings" ] || { echo "::error::No settings.gradle(.kts) found inside the zip"; exit 1; }
+          dir=$(dirname "$settings")
+          name=$(grep -oE 'rootProject\.name *= *"[^"]+"' "$settings" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+          [ -n "$name" ] || name=app
+          echo "Project dir: $dir  (name: $name)"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version (so it installs over the old one)
+        id: ver
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          # versionCode = minutes since 1970: always higher than the previous build, never repeats.
+          code=$(( $(date +%s) / 60 ))
+          vname="1.0.${{ github.run_number }}"
+          f=$(ls app/build.gradle.kts app/build.gradle 2>/dev/null | head -n1)
+          [ -n "$f" ] || { echo "::error::app/build.gradle(.kts) not found"; exit 1; }
+          sed -i -E "s/versionCode *=? *[0-9]+/versionCode = $code/; s/versionName *=? *\"[^\"]*\"/versionName = \"$vname\"/" "$f"
+          grep -nE 'versionCode|versionName' "$f"
+          echo "code=$code"  >> "$GITHUB_OUTPUT"
+          echo "name=$vname" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9   # used only when the zip has no gradlew
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build release APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          if [ -f gradlew ]; then chmod +x gradlew; G=./gradlew; else G=gradle; fi
+          $G --no-daemon -Dorg.gradle.jvmargs=-Xmx3g :app:assembleRelease
+
+      - name: Sign APK
+        id: sign
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -e
+          KS="$GITHUB_WORKSPACE/.signing/release.jks"
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          in=$(ls app/build/outputs/apk/release/*.apk | head -n1)
+          out="${{ steps.proj.outputs.name }}-v${{ steps.ver.outputs.name }}.apk"
+          "$BT/zipalign" -f -p 4 "$in" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign \
+            --ks "$KS" --ks-key-alias release \
+            --ks-pass pass:android --key-pass pass:android \
+            --out "$out" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs "$out" | head -n3
+          echo "apk=$PWD/$out" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.ver.outputs.name }}"
+          gh release create "$tag" "${{ steps.sign.outputs.apk }}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "${{ steps.proj.outputs.name }} $tag" \
+            --notes "Built from \`${{ steps.zip.outputs.file }}\` (commit ${{ github.sha }}).
+          Version name: ${{ steps.ver.outputs.name }} · version code: ${{ steps.ver.outputs.code }}.
+          Install over the previous version: your data is kept (same built-in signing key every time)."
